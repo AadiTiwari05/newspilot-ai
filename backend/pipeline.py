@@ -278,16 +278,19 @@ CATEGORIES = [
 ]
 
 GROQ_SYSTEM_PROMPT = f"""You are a professional news editor. You will receive a JSON array of news articles.
-Return ONLY valid JSON (no markdown, no extra text). You must return a JSON array where each object has the exact same "id" as the input, plus these fields:
-[
-  {{
-    "id": 123,
-    "headline": "A concise, engaging headline (max 15 words)",
-    "category": "One of: {', '.join(CATEGORIES)}",
-    "sentiment": "One of: Positive, Neutral, Negative",
-    "summary": "Three paragraphs summarizing the article. Each paragraph should be 2-3 sentences. Write in a clear, journalistic style."
-  }}
-]"""
+Return ONLY valid JSON (no markdown, no extra text). You must return a JSON object with a single key "results" containing an array. Each object in the array must have the exact same "id" as the input, plus these fields:
+{{
+  "results": [
+    {{
+      "id": 123,
+      "headline": "A concise, engaging headline (max 15 words)",
+      "category": "One of: {', '.join(CATEGORIES)}",
+      "sentiment": "One of: Positive, Neutral, Negative",
+      "summary": "Three paragraphs summarizing the article. Each paragraph should be 2-3 sentences. Write in a clear, journalistic style."
+    }}
+  ]
+}}
+IMPORTANT: Ensure all strings are properly escaped and contain no literal control characters."""
 
 
 def process_with_groq_batch(client: Groq, articles: list, retries: int = 3) -> dict:
@@ -310,6 +313,7 @@ def process_with_groq_batch(client: Groq, articles: list, retries: int = 3) -> d
                 ],
                 temperature=0.3,
                 max_tokens=3000,
+                response_format={"type": "json_object"},
             )
             raw = resp.choices[0].message.content.strip()
 
@@ -317,7 +321,8 @@ def process_with_groq_batch(client: Groq, articles: list, retries: int = 3) -> d
             raw = re.sub(r"^```(?:json)?\s*", "", raw)
             raw = re.sub(r"\s*```$", "", raw)
 
-            results_array = json.loads(raw)
+            parsed = json.loads(raw)
+            results_array = parsed.get("results", [])
             
             # Convert JSON array to dict mapped by 'id'
             if isinstance(results_array, list):
