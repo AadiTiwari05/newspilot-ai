@@ -277,21 +277,28 @@ CATEGORIES = [
     "Sports", "Science", "Health", "Entertainment", "India"
 ]
 
-GROQ_SYSTEM_PROMPT = f"""You are a professional news editor. Given a news article, return ONLY valid JSON (no markdown, no extra text) in this exact format:
-{{
-  "headline": "A concise, engaging headline (max 15 words)",
-  "category": "One of: {', '.join(CATEGORIES)}",
-  "sentiment": "One of: Positive, Neutral, Negative",
-  "summary": "Three paragraphs summarizing the article. Each paragraph should be 2-3 sentences. Write in a clear, journalistic style."
-}}"""
+GROQ_SYSTEM_PROMPT = f"""You are a professional news editor. You will receive a JSON array of news articles.
+Return ONLY valid JSON (no markdown, no extra text). You must return a JSON array where each object has the exact same "id" as the input, plus these fields:
+[
+  {{
+    "id": 123,
+    "headline": "A concise, engaging headline (max 15 words)",
+    "category": "One of: {', '.join(CATEGORIES)}",
+    "sentiment": "One of: Positive, Neutral, Negative",
+    "summary": "Three paragraphs summarizing the article. Each paragraph should be 2-3 sentences. Write in a clear, journalistic style."
+  }}
+]"""
 
 
-def process_with_groq(client: Groq, article_text: str, headline: str, retries: int = 3) -> dict:
+def process_with_groq_batch(client: Groq, articles: list, retries: int = 3) -> dict:
     """
-    Send article to Groq for combined classification + summarization.
-    Returns parsed JSON dict or None on failure.
+    Send a batch of articles to Groq.
+    Returns a dictionary mapping article id -> result dict, or None on failure.
     """
-    prompt = f"Headline: {headline}\n\nArticle:\n{article_text}"
+    if not articles:
+        return {}
+
+    prompt = json.dumps(articles, ensure_ascii=False)
 
     for attempt in range(retries):
         try:
@@ -302,7 +309,7 @@ def process_with_groq(client: Groq, article_text: str, headline: str, retries: i
                     {"role": "user",   "content": prompt},
                 ],
                 temperature=0.3,
-                max_tokens=800,
+                max_tokens=3000,
             )
             raw = resp.choices[0].message.content.strip()
 
@@ -310,20 +317,25 @@ def process_with_groq(client: Groq, article_text: str, headline: str, retries: i
             raw = re.sub(r"^```(?:json)?\s*", "", raw)
             raw = re.sub(r"\s*```$", "", raw)
 
-            return json.loads(raw)
+            results_array = json.loads(raw)
+            
+            # Convert JSON array to dict mapped by 'id'
+            if isinstance(results_array, list):
+                return {res["id"]: res for res in results_array if "id" in res}
+            return {}
 
         except json.JSONDecodeError as e:
-            print(f"[Groq] JSON parse error (attempt {attempt+1}): {e}")
+            print(f"[Groq] JSON parse error on batch (attempt {attempt+1}): {e}")
         except Exception as e:
             err = str(e)
             if "401" in err or "invalid_api_key" in err:
                 raise PermissionError(f"Groq API key invalid: {err}")
             if "429" in err:
                 wait = 35 * (attempt + 1)
-                print(f"[Groq] Rate limited, waiting {wait}s...")
+                print(f"[Groq] Rate limited on batch, waiting {wait}s...")
                 time.sleep(wait)
             else:
-                print(f"[Groq] Error (attempt {attempt+1}): {err}")
+                print(f"[Groq] Error on batch (attempt {attempt+1}): {err}")
                 return None
 
     return None
@@ -371,23 +383,16 @@ def run_pipeline(groq_api_key: str, newsapi_key: str = None):
     update_pipeline_state("Scraping articles", 40,
                           articles_found=len(unique_articles))
 
-    # ── Steps 4 & 5: Scrape + Groq process each unique article ──────────────
+    # ── Steps 4 & 5: Scrape + Groq process (Batched) ──────────────
     saved = 0
     total = len(unique_articles)
 
+    # Pre-process all articles (scrape and truncate)
+    prepared_articles = []
     for idx, article in enumerate(unique_articles):
-        pct = 40 + int((idx / total) * 55)  # 40% → 95%
-        update_pipeline_state(
-            f"Processing article {idx+1}/{total}",
-            pct,
-            articles_found=total,
-            articles_saved=saved,
-        )
-
         if not article.get("url"):
             continue
 
-        # Scrape full text + og:image
         scraped = scrape_article(article["url"])
         if scraped:
             article_text = scraped["text"]
@@ -399,32 +404,62 @@ def run_pipeline(groq_api_key: str, newsapi_key: str = None):
         if not article_text.strip():
             continue
 
-        # Truncate text to 1500 chars to prevent Groq Tokens-Per-Minute limit (429 errors)
-        article_text = article_text[:1500]
+        # Truncate text to 1000 chars to avoid batch token limits
+        article_text = article_text[:1000]
 
-        # Groq: classify + summarize
+        prepared_articles.append({
+            "id": idx,
+            "headline": article["headline"],
+            "text": article_text,
+            "_original": article
+        })
+
+    # Process in batches of 10
+    BATCH_SIZE = 10
+    total_prepared = len(prepared_articles)
+
+    for i in range(0, total_prepared, BATCH_SIZE):
+        batch = prepared_articles[i : i + BATCH_SIZE]
+        pct = 40 + int((i / max(1, total_prepared)) * 55)
+
+        update_pipeline_state(
+            f"Processing batch {i//BATCH_SIZE + 1} (articles {i+1}-{min(i+BATCH_SIZE, total_prepared)}/{total_prepared})",
+            pct,
+            articles_found=total,
+            articles_saved=saved,
+        )
+
+        # Build prompt input without sending the entire original dict
+        batch_inputs = [{"id": item["id"], "headline": item["headline"], "text": item["text"]} for item in batch]
+
         try:
-            result = process_with_groq(client, article_text, article["headline"])
+            results_map = process_with_groq_batch(client, batch_inputs)
         except PermissionError as e:
             print(f"[Pipeline] 🔴 FATAL auth error: {e}")
             update_pipeline_state("Error", pct, error=str(e))
             return
 
-        if not result:
+        if not results_map:
+            print(f"[Pipeline] Batch {i//BATCH_SIZE + 1} failed, skipping.")
             continue
 
-        # Merge Groq result into article dict
-        article["headline"]  = result.get("headline", article["headline"])
-        article["summary"]   = result.get("summary", "")
-        article["category"]  = result.get("category", article.get("category", "General"))
-        article["sentiment"] = result.get("sentiment", "Neutral")
+        # Merge results and save
+        for item in batch:
+            res = results_map.get(item["id"])
+            if not res:
+                continue
 
-        # Sanitize: SQLite only accepts str/int/float/None — convert any dict/list to str
-        upsert_article(_sanitize(article))
-        saved += 1
+            orig = item["_original"]
+            orig["headline"]  = res.get("headline", orig["headline"])
+            orig["summary"]   = res.get("summary", "")
+            orig["category"]  = res.get("category", orig.get("category", "General"))
+            orig["sentiment"] = res.get("sentiment", "Neutral")
 
-        # Throttle slightly to be kind to Groq free tier
-        time.sleep(0.5)
+            upsert_article(_sanitize(orig))
+            saved += 1
+
+        # Throttle between batches
+        time.sleep(2)
 
     # ── Done ─────────────────────────────────────────────────────────────────
     update_pipeline_state("Complete", 100,
