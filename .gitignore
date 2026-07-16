@@ -19,6 +19,9 @@ build/
 backend/News.json
 backend/New_News.json
 backend/News_list.json
+backend/newspilot.db
+backend/newspilot.db-shm
+backend/newspilot.db-wal
 
 # ── Test / debug scripts ──────────────────────────────────────────────────────
 backend/test_groq_key.py

@@ -13,8 +13,7 @@ export default defineConfig({
       "/api": {
         target: "http://127.0.0.1:5000",
         changeOrigin: true,
-        rewrite: (path) => path.replace(/^\/api/, ""),
-        // Retry connection: don't fail hard if Flask is still starting
+        // No rewrite — Flask routes are already /api/news, /api/categories, etc.
         configure: (proxy) => {
           proxy.on("error", (err) => {
             console.warn("[Vite Proxy] Backend not reachable yet:", err.code);
