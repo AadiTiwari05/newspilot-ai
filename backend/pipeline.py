@@ -306,13 +306,13 @@ def process_with_groq_batch(client: Groq, articles: list, retries: int = 3) -> d
     for attempt in range(retries):
         try:
             resp = client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
+                model="llama-3.1-8b-instant",
                 messages=[
                     {"role": "system", "content": GROQ_SYSTEM_PROMPT},
                     {"role": "user",   "content": prompt},
                 ],
                 temperature=0.3,
-                max_tokens=3000,
+                max_tokens=1500,
                 response_format={"type": "json_object"},
             )
             raw = resp.choices[0].message.content.strip()
@@ -409,8 +409,8 @@ def run_pipeline(groq_api_key: str, newsapi_key: str = None):
         if not article_text.strip():
             continue
 
-        # Truncate text to 1000 chars to avoid batch token limits
-        article_text = article_text[:1000]
+        # Truncate text to 600 chars to avoid batch token limits
+        article_text = article_text[:600]
 
         prepared_articles.append({
             "id": idx,
@@ -463,8 +463,8 @@ def run_pipeline(groq_api_key: str, newsapi_key: str = None):
             upsert_article(_sanitize(orig))
             saved += 1
 
-        # Throttle between batches
-        time.sleep(2)
+        # Throttle between batches (12s ensures max 5 batches per minute to avoid Rate Limits)
+        time.sleep(12)
 
     # ── Done ─────────────────────────────────────────────────────────────────
     update_pipeline_state("Complete", 100,
